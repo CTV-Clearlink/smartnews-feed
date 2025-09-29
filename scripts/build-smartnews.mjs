@@ -6,7 +6,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // --- CONFIG ---
 const FEED_URL = "https://www.cabletv.com/feed"; // your current RSS feed
-const LOGO_URL = "https://www.cabletv.com/path/to/logo-700x100.png"; // TODO: replace with your real 700x100 PNG
+const LOGO_URL = const LOGO_URL = "https://i.ibb.co/sptKgp34/CTV-Feed-Logo.png"; // TODO: replace with your real 700x100 PNG
 const MAX_LINKS = 20; // keep first N links in content
 const OUTPUT = __dirname + "/../dist/feed-smartnews.xml";
 
