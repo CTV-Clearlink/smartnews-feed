@@ -7,12 +7,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // --- CONFIG ---
 const FEED_URL = "https://www.cabletv.com/feed";
 const LOGO_URL = "https://i.ibb.co/sptKgp34/CTV-Feed-Logo.png"; // 700x100 PNG
-const MAX_LINKS = 12;                  // tighten link cap to pass validator
+const MAX_LINKS = 8;                    // tighter cap
 const OUTPUT_DIR = __dirname + "/../dist";
 const OUTPUT = OUTPUT_DIR + "/feed-smartnews.xml";
-const UA = "Mozilla/5.0 (compatible; SmartNews-Feed-Builder/1.1; +https://CTV-Clearlink.github.io)";
-
-// Domains/extensions we consider safe for thumbnails
+const UA = "Mozilla/5.0 (compatible; SmartNews-Feed-Builder/1.2; +https://CTV-Clearlink.github.io)";
 const ALLOWED_IMG_EXT = /\.(png|jpe?g|webp|gif)(\?|#|$)/i;
 
 async function main() {
@@ -54,17 +52,23 @@ async function rewriteItems(xmlStr) {
   for (let item of items) {
     let out = item;
 
-    // 1) Clean up content:encoded and cap link count
+    // 0) Remove any existing (possibly invalid) analytics blocks
+    out = out.replace(/<snf:analytics>[\s\S]*?<\/snf:analytics>/gi, "");
+
+    // 1) Clean up content:encoded and cap links
     out = out.replace(
       /(<content:encoded><!\[CDATA\[)([\s\S]*?)(\]\]><\/content:encoded>)/,
       (_, open, body, close) => {
         body = stripJunk(body);
+        body = removeUnsafeAnchors(body);  // drop mailto/tel/javascript anchors
         body = capAnchors(body, MAX_LINKS);
+        // Final hard cap: if any <a> remain beyond MAX_LINKS, unwrap them
+        body = hardCapAnchors(body, MAX_LINKS);
         return open + body + close;
       }
     );
 
-    // 2) Ensure <media:thumbnail> with sanitized URL
+    // 2) Ensure <media:thumbnail> with sanitized URL (or sanitize existing)
     if (!/<media:thumbnail\b/.test(out)) {
       const link = (out.match(/<link>([^<]+)<\/link>/)?.[1] || "").split("?")[0];
       if (link) {
@@ -76,18 +80,12 @@ async function rewriteItems(xmlStr) {
             const thumb = sanitizeUrl(rawOg);
             if (thumb && ALLOWED_IMG_EXT.test(thumb)) {
               out = out.replace("</item>", `<media:thumbnail url="${thumb}" /></item>`);
-            } else {
-              console.warn("Skip thumbnail (invalid or disallowed):", rawOg);
             }
-          } else {
-            console.warn("Article fetch failed", pageRes.status, pageRes.statusText, link);
           }
-        } catch (e) {
-          console.warn("og:image lookup failed for", link, e.message);
-        }
+        } catch { /* ignore per-item errors */ }
       }
     } else {
-      // Sanitize existing media:thumbnail URL
+      // Sanitize provided thumbnail URL
       out = out.replace(/<media:thumbnail[^>]+url=["']([^"']+)["'][^>]*\/>/i, (m, u) => {
         const s = sanitizeUrl(u);
         return (s && ALLOWED_IMG_EXT.test(s)) ? `<media:thumbnail url="${s}" />` : "";
@@ -96,13 +94,6 @@ async function rewriteItems(xmlStr) {
 
     // 3) Strip UTM params from <link>
     out = out.replace(/<link>([^<]+)<\/link>/, (_, u) => `<link>${stripUtm(u)}</link>`);
-
-    // 4) Add snf:analytics (recommended)
-    if (!/<snf:analytics>/.test(out)) {
-      out = out.replace("</item>", `<snf:analytics><![CDATA[
-  <!-- Place GA4/analytics script here if desired (no iframes). -->
-]]></snf:analytics></item>`);
-    }
 
     xmlStr = xmlStr.replace(item, out);
   }
@@ -113,21 +104,35 @@ async function rewriteItems(xmlStr) {
 // --- helpers ---
 
 function stripJunk(html) {
-  // Remove nav/footer/aside and common link-heavy blocks
-  let out = html
+  return html
     .replace(/<(nav|footer|aside)[\s\S]*?<\/\1>/gi, "")
     .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, "")
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<style[\s\S]*?<\/style>/gi, "")
     .replace(/<div[^>]+class=(["']).*?\b(related|share|social|subscribe|breadcrumbs|tags|tag-?cloud|promo|newsletter|author|bio|widget|sidebar|footer)\b.*?\1[^>]*>[\s\S]*?<\/div>/gi, "")
     .replace(/<ul[^>]+class=(["']).*?\b(related|share|social|tags|sources)\b.*?\1[^>]*>[\s\S]*?<\/ul>/gi, "")
-    .replace(/<section[^>]+class=(["']).*?\b(related|share|social|subscribe|tags|newsletter)\b.*?\1[^>]*>[\s\S]*?<\/section>/gi, "");
-  return out;
+    .replace(/<section[^>]+class=(["']).*?\b(related|share|social|subscribe|tags|newsletter)\b.*?\1[^>]*>[\s\S]*?<\/section>/gi, "")
+    // unwrap anchors that only wrap images/captions (they add link count but little value)
+    .replace(/<a\b[^>]*>\s*(<img[\s\S]*?>)\s*<\/a>/gi, "$1");
+}
+
+function removeUnsafeAnchors(html) {
+  // unwrap anchors with unsafe/non-editorial schemes
+  return html.replace(
+    /<a\b[^>]*href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gis,
+    (m, href, inner) => (/^(mailto:|tel:|javascript:)/i.test(href) ? inner : m)
+  );
 }
 
 function capAnchors(html, max) {
   let i = 0;
   return html.replace(/<a\b[^>]*>(.*?)<\/a>/gis, (m, inner) => (++i <= max) ? m : inner);
+}
+
+function hardCapAnchors(html, max) {
+  // Second pass: unwrap any remaining links beyond the cap (belt-and-suspenders)
+  let count = 0;
+  return html.replace(/<a\b[^>]*>(.*?)<\/a>/gis, (m, inner) => (++count > max) ? inner : m);
 }
 
 function stripUtm(u) {
@@ -140,17 +145,12 @@ function stripUtm(u) {
 
 function sanitizeUrl(u) {
   if (!u) return null;
-  // trim, convert spaces to %20, ensure https, drop data/mailto/tel/javascript
   let s = u.trim().replace(/\s/g, "%20");
   if (/^(data:|mailto:|tel:|javascript:)/i.test(s)) return null;
-  // Make relative -> absolute? (we only accept absolute)
   if (!/^https?:\/\//i.test(s)) return null;
-  // Force https
   s = s.replace(/^http:\/\//i, "https://");
-  // Encode any stray characters
   try {
     const url = new URL(s);
-    // recompose to ensure proper encoding
     return url.toString();
   } catch {
     try { return encodeURI(s); } catch { return null; }
