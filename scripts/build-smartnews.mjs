@@ -5,82 +5,27 @@ import { fileURLToPath } from "url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // --- CONFIG ---
-const FEED_URL = "https://www.cabletv.com/feed"; // your current RSS feed
-const LOGO_URL = const LOGO_URL = "https://i.ibb.co/sptKgp34/CTV-Feed-Logo.png"; // TODO: replace with your real 700x100 PNG
-const MAX_LINKS = 20; // keep first N links in content
-const OUTPUT = __dirname + "/../dist/feed-smartnews.xml";
+const FEED_URL = "https://www.cabletv.com/feed";
+const LOGO_URL = "https://i.ibb.co/sptKgp34/CTV-Feed-Logo.png"; // 700x100 PNG (your confirmed URL)
+const MAX_LINKS = 20;                 // reduce if SmartNews still flags "too many links"
+const OUTPUT_DIR = __dirname + "/../dist";
+const OUTPUT = OUTPUT_DIR + "/feed-smartnews.xml";
+const UA = "Mozilla/5.0 (compatible; SmartNews-Feed-Builder/1.0; +https://CTV-Clearlink.github.io)";
 
-// --- FETCH ORIGIN FEED ---
-let xml = await (await fetch(FEED_URL, { headers: { Accept: "application/rss+xml" } })).text();
+async function main() {
+  console.log("==> Create output dir");
+  mkdirSync(OUTPUT_DIR, { recursive: true });
 
-// --- ENSURE NAMESPACES ---
-if (!/xmlns:snf=/.test(xml)) {
-  xml = xml.replace(
-    /<rss([^>]*)>/,
-    '<rss$1 xmlns:snf="http://www.smartnews.be/snf" xmlns:media="http://search.yahoo.com/mrss/">'
-  );
-}
+  console.log("==> Fetching origin feed:", FEED_URL);
+  const res = await fetch(FEED_URL, {
+    headers: { "Accept": "application/rss+xml", "User-Agent": UA }
+  });
+  if (!res.ok) throw new Error(`Fetch ${FEED_URL} failed: ${res.status} ${res.statusText}`);
 
-// --- INJECT CHANNEL LOGO (IF MISSING) ---
-if (!/<snf:logo>/.test(xml)) {
-  xml = xml.replace("<channel>", `<channel>
-    <snf:logo><url>${LOGO_URL}</url></snf:logo>`);
-}
+  let xml = await res.text();
+  if (!xml.includes("<rss")) throw new Error("Origin did not return RSS/XML (no <rss> tag)");
 
-// --- PER-ITEM TRANSFORMS ---
-xml = await rewriteItems(xml);
-
-// --- WRITE OUTPUT ---
-mkdirSync(__dirname + "/../dist", { recursive: true });
-writeFileSync(OUTPUT, xml, "utf8");
-console.log("Wrote", OUTPUT);
-
-async function rewriteItems(xmlStr) {
-  const items = xmlStr.match(/<item>[\s\S]*?<\/item>/g) || [];
-  for (const item of items) {
-    let out = item;
-
-    // 1) Clean up content:encoded
-    out = out.replace(
-      /(<content:encoded><!\[CDATA\[)([\s\S]*?)(\]\]><\/content:encoded>)/,
-      (_, open, body, close) => {
-        body = body
-          .replace(/<(nav|footer|aside)[\s\S]*?<\/\1>/gi, "")
-          .replace(/<div[^>]+class=(["']).*?(related|share|social|subscribe|breadcrumbs|tags|tag-cloud|promo|newsletter).*?\1[^>]*>[\s\S]*?<\/div>/gi, "");
-        let i = 0;
-        body = body.replace(/<a\b[^>]*>(.*?)<\/a>/gis, (m, inner) =>
-          ++i <= MAX_LINKS ? m : inner
-        );
-        return open + body + close;
-      }
-    );
-
-    // 2) Add thumbnail if missing
-    if (!/<media:thumbnail\b/.test(out)) {
-      const link = (out.match(/<link>([^<]+)<\/link>/)?.[1] || "").split("?")[0];
-      if (link) {
-        try {
-          const html = await (await fetch(link, { headers: { Accept: "text/html" } })).text();
-          const og = html.match(
-            /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i
-          )?.[1];
-          if (og) out = out.replace("</item>", `<media:thumbnail url="${og}" /></item>`);
-        } catch { /* ignore errors per item */ }
-      }
-    }
-
-    // 3) Remove UTM params from <link>
-    out = out.replace(/<link>([^<]+)<\/link>/, (_, u) => {
-      try {
-        const url = new URL(u);
-        ["utm_source","utm_medium","utm_campaign","utm_term","utm_content"].forEach(p =>
-          url.searchParams.delete(p)
-        );
-        return `<link>${url.toString()}</link>`;
-      } catch { return `<link>${u}</link>`; }
-    });
-
-    xmlStr = xmlStr.replace(item, out);
-  }
-  return xmlStr;
-}
+  console.log("==> Ensuring namespaces");
+  if (!/xmlns:snf=/.test(xml)) {
+    xml = xml.replace(
+      /<rss(
