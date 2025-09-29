@@ -7,10 +7,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // --- CONFIG ---
 const FEED_URL = "https://www.cabletv.com/feed";
 const LOGO_URL = "https://i.ibb.co/sptKgp34/CTV-Feed-Logo.png"; // 700x100 PNG
-const MAX_LINKS = 6;                    // tighter cap
+const MAX_LINKS = 4;                    // very tight cap
 const OUTPUT_DIR = __dirname + "/../dist";
 const OUTPUT = OUTPUT_DIR + "/feed-smartnews.xml";
-const UA = "Mozilla/5.0 (compatible; SmartNews-Feed-Builder/1.2; +https://CTV-Clearlink.github.io)";
+const UA = "Mozilla/5.0 (compatible; SmartNews-Feed-Builder/1.3; +https://CTV-Clearlink.github.io)";
 const ALLOWED_IMG_EXT = /\.(png|jpe?g|webp|gif)(\?|#|$)/i;
 
 async function main() {
@@ -24,6 +24,7 @@ async function main() {
   let xml = await res.text();
   if (!xml.includes("<rss")) throw new Error("Origin did not return RSS/XML (no <rss> tag)");
 
+  // Namespaces
   if (!/xmlns:snf=/.test(xml)) {
     xml = xml.replace(
       /<rss([^>]*)>/,
@@ -31,11 +32,13 @@ async function main() {
     );
   }
 
+  // Channel logo
   if (!/<snf:logo>/.test(xml)) {
     xml = xml.replace("<channel>", `<channel>
     <snf:logo><url>${LOGO_URL}</url></snf:logo>`);
   }
 
+  // Items
   xml = await rewriteItems(xml);
 
   writeFileSync(OUTPUT, xml, "utf8");
@@ -49,10 +52,17 @@ async function rewriteItems(xmlStr) {
   for (let item of items) {
     let out = item;
 
-    // Remove any existing analytics blocks (still optional per SmartNews)
+    // 0) Fix titles: strip WP shortcodes like [current_date ...]
+    out = out.replace(/<title>\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))\s*<\/title>/i, (_m, cdata, plain) => {
+      const raw = (cdata ?? plain ?? "").trim();
+      const cleaned = stripShortcodes(raw).replace(/\s+\|\s+/g, " | ").trim();
+      return `<title><![CDATA[${cleaned}]]></title>`;
+    });
+
+    // Remove any existing analytics blocks (optional in SmartNews)
     out = out.replace(/<snf:analytics>[\s\S]*?<\/snf:analytics>/gi, "");
 
-    // Clean + cap links inside content:encoded
+    // 1) Clean + cap links inside content:encoded
     out = out.replace(
       /(<content:encoded><!\[CDATA\[)([\s\S]*?)(\]\]><\/content:encoded>)/,
       (_, open, body, close) => {
@@ -60,12 +70,16 @@ async function rewriteItems(xmlStr) {
         body = removeUnsafeAnchors(body);
         body = unwrapLowValueAnchors(body);
         body = capAnchors(body, MAX_LINKS);
-        body = hardCapAnchors(body, MAX_LINKS);
+
+        // Hard cap: if still over MAX_LINKS, unwrap ALL remaining <a> tags
+        if (anchorCount(body) > MAX_LINKS) {
+          body = body.replace(/<a\b[^>]*>(.*?)<\/a>/gis, "$1");
+        }
         return open + body + close;
       }
     );
 
-    // Ensure/sanitize media:thumbnail
+    // 2) Ensure/sanitize media:thumbnail
     if (!/<media:thumbnail\b/.test(out)) {
       const link = (out.match(/<link>([^<]+)<\/link>/)?.[1] || "").split("?")[0];
       if (link) {
@@ -88,7 +102,7 @@ async function rewriteItems(xmlStr) {
       });
     }
 
-    // Strip UTM in <link>
+    // 3) Strip UTM in <link>
     out = out.replace(/<link>([^<]+)<\/link>/, (_, u) => `<link>${stripUtm(u)}</link>`);
 
     xmlStr = xmlStr.replace(item, out);
@@ -97,6 +111,11 @@ async function rewriteItems(xmlStr) {
 }
 
 // --- helpers ---
+
+function stripShortcodes(str) {
+  // Remove any [shortcode ...] blocks
+  return str.replace(/\[[^\]]+\]/g, "").replace(/\s{2,}/g, " ").trim();
+}
 
 function stripJunk(html) {
   return html
@@ -116,7 +135,7 @@ function stripJunk(html) {
 }
 
 function removeUnsafeAnchors(html) {
-  // unwrap non-editorial schemes and empty/hashtag links
+  // unwrap non-editorial schemes and hash anchors
   return html.replace(
     /<a\b[^>]*href=["']([^"']*)["'][^>]*>(.*?)<\/a>/gis,
     (m, href, inner) => (/^(mailto:|tel:|javascript:|#)/i.test(href) ? inner : m)
@@ -124,7 +143,7 @@ function removeUnsafeAnchors(html) {
 }
 
 function unwrapLowValueAnchors(html) {
-  // unwrap anchors inside low-value containers: figcaption, caption, small, em dashes in credits, lists, tables
+  // unwrap anchors inside low-value containers: figcaption, caption, small
   html = html.replace(/<(figcaption|caption|small)[^>]*>[\s\S]*?<\/\1>/gi, (m) =>
     m.replace(/<a\b[^>]*>(.*?)<\/a>/gis, "$1")
   );
@@ -132,7 +151,7 @@ function unwrapLowValueAnchors(html) {
   html = html.replace(/<(ul|ol|table)[^>]*>[\s\S]*?<\/\1>/gi, (m) =>
     m.replace(/<a\b[^>]*>(.*?)<\/a>/gis, "$1")
   );
-  // remove “read more”, “continue”, “back to top”, “view source(s)” links
+  // remove “read more”, “continue”, “back to top”, “view sources”
   html = html.replace(
     /<a\b[^>]*>(\s*(read\s*more|continue|back\s*to\s*top|view\s*sources?|sources?|references?)\s*)<\/a>/gi,
     (m, inner) => inner
@@ -145,9 +164,10 @@ function capAnchors(html, max) {
   return html.replace(/<a\b[^>]*>(.*?)<\/a>/gis, (m, inner) => (++i <= max) ? m : inner);
 }
 
-function hardCapAnchors(html, max) {
+function anchorCount(html) {
   let count = 0;
-  return html.replace(/<a\b[^>]*>(.*?)<\/a>/gis, (m, inner) => (++count > max) ? inner : m);
+  html.replace(/<a\b[^>]*>(.*?)<\/a>/gis, () => { count++; return ""; });
+  return count;
 }
 
 function stripUtm(u) {
