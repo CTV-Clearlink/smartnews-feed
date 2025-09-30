@@ -1,114 +1,155 @@
+// scripts/build-smartnews.mjs (SmartNews-focused)
 import { mkdirSync, writeFileSync } from "fs";
 import { dirname } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// --- CONFIG ---
-const FEED_URL = "https://www.cabletv.com/feed";
-const LOGO_URL = "https://i.ibb.co/sptKgp34/CTV-Feed-Logo.png"; // 700x100 PNG
-const MAX_LINKS = 2;                    // ultra-tight cap
+/** ---------------- CONFIG ---------------- */
+const SOURCE_FEED_URL = "https://www.cabletv.com/feed";
 const OUTPUT_DIR = __dirname + "/../dist";
 const OUTPUT = OUTPUT_DIR + "/feed-smartnews.xml";
-const UA = "Mozilla/5.0 (compatible; SmartNews-Feed-Builder/1.4; +https://CTV-Clearlink.github.io)";
+
+const UA = "Mozilla/5.0 (compatible; SmartFeed-Builder/3.0; +https://CTV-Clearlink.github.io)";
+
+// Keep article bodies but remove all inline links to avoid “too many links”
+const FORCE_NO_LINKS = true;
+
+// Hard limits to avoid “Too large content size”
+const ITEM_LIMIT = 30;          // include only the newest N items
+const CONTENT_MAX_CHARS = 8000; // trim content:encoded to this length (per item)
+
+// Thumbnail policy
 const ALLOWED_IMG_EXT = /\.(png|jpe?g|webp|gif)(\?|#|$)/i;
+// Use a PNG (not SVG) as a final fallback:
+const DEFAULT_THUMB_URL = "https://i.ibb.co/V0FWL4m9/CTV-Logo.png"; // replace with your own PNG if you prefer
+
+// SmartNews logo (required if missing)
+const SMARTNEWS_LOGO_URL = "https://i.ibb.co/sptKgp34/CTV-Feed-Logo.png"; // 700x100 PNG
+/** ---------------------------------------- */
 
 async function main() {
   mkdirSync(OUTPUT_DIR, { recursive: true });
 
-  const res = await fetch(FEED_URL, { headers: { "Accept": "application/rss+xml", "User-Agent": UA } });
-  if (!res.ok) throw new Error(`Fetch ${FEED_URL} failed: ${res.status} ${res.statusText}`);
+  const res = await fetch(SOURCE_FEED_URL, {
+    headers: { Accept: "application/rss+xml", "User-Agent": UA }
+  });
+  if (!res.ok) throw new Error(`Fetch ${SOURCE_FEED_URL} failed: ${res.status} ${res.statusText}`);
 
   let xml = await res.text();
   if (!xml.includes("<rss")) throw new Error("Origin did not return RSS/XML (no <rss> tag)");
 
-  // Namespaces
-  if (!/xmlns:snf=/.test(xml)) {
+  // Ensure namespaces: media + SmartNews snf
+  if (!/xmlns:snf=/.test(xml) || !/xmlns:media=/.test(xml)) {
     xml = xml.replace(
       /<rss([^>]*)>/,
       '<rss$1 xmlns:snf="http://www.smartnews.be/snf" xmlns:media="http://search.yahoo.com/mrss/">'
     );
   }
 
-  // Channel logo
+  // Inject SmartNews logo if missing
   if (!/<snf:logo>/.test(xml)) {
     xml = xml.replace("<channel>", `<channel>
-    <snf:logo><url>${LOGO_URL}</url></snf:logo>`);
+    <snf:logo><url>${SMARTNEWS_LOGO_URL}</url></snf:logo>`);
   }
 
-  // Items
+  // Strip any existing snf:analytics (optional & often flagged if malformed)
+  xml = xml.replace(/<snf:analytics>[\s\S]*?<\/snf:analytics>/gi, "");
+
+  // Limit item count early to keep the file small
+  xml = limitItems(xml, ITEM_LIMIT);
+
+  // Per-item rewrites (content trimming, thumbnails, authors, UTM strip)
   xml = await rewriteItems(xml);
 
   writeFileSync(OUTPUT, xml, "utf8");
   console.log("Wrote", OUTPUT);
 }
 
+function limitItems(xml, limit) {
+  const items = xml.match(/<item>[\s\S]*?<\/item>/g) || [];
+  if (items.length <= limit) return xml;
+  const keep = items.slice(0, limit).join("\n");
+  return xml.replace(/<channel>[\s\S]*?<\/channel>/, (m) => {
+    const header = m.split(/<item>/)[0]; // includes <channel> ... up to first item
+    return header + keep + "\n</channel>";
+  });
+}
+
 async function rewriteItems(xmlStr) {
   const items = xmlStr.match(/<item>[\s\S]*?<\/item>/g) || [];
-  console.log(`Found ${items.length} <item> elements`);
+  console.log(`Processing ${items.length} <item> elements`);
 
-  for (let item of items) {
+  for (const item of items) {
     let out = item;
 
-    // 0) Fix titles: remove WP shortcodes and decode simple pipe entity
+    // Title cleanup: remove [shortcodes], decode pipe, trim; fix dangling "in"
     out = out.replace(/<title>\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))\s*<\/title>/i, (_m, cdata, plain) => {
-      let raw = (cdata ?? plain ?? "").trim();
-      raw = raw.replace(/\[[^\]]+\]/g, "").replace(/&#124;/g, "|").replace(/\s{2,}/g, " ").trim();
-      // If a title ends with " in" due to shortcode removal, append the current year
-      if (/\bin\s*$/i.test(raw)) raw = raw + new Date().getFullYear();
-      return `<title><![CDATA[${raw}]]></title>`;
+      let t = (cdata ?? plain ?? "").trim();
+      t = t.replace(/\[[^\]]+\]/g, "") // remove shortcodes like [current_date …]
+           .replace(/&#124;/g, "|")
+           .replace(/\s{2,}/g, " ")
+           .trim();
+      if (/\bin\s*$/i.test(t)) t += new Date().getFullYear();
+      return `<title><![CDATA[${t}]]></title>`;
     });
 
-    // Remove any existing analytics blocks (optional in SmartNews)
+    // Remove any existing (possibly invalid) analytics blocks
     out = out.replace(/<snf:analytics>[\s\S]*?<\/snf:analytics>/gi, "");
 
-    // 1) Clean + cap links inside content:encoded (very aggressive)
+    // CONTENT: clean, remove links, and TRIM length to avoid oversized feed
     out = out.replace(
       /(<content:encoded><!\[CDATA\[)([\s\S]*?)(\]\]><\/content:encoded>)/,
       (_, open, body, close) => {
         body = stripJunk(body);
-        body = removeUnsafeAnchors(body);
         body = unwrapLowValueAnchors(body);
-
-        // remove anchors inside headings
+        body = removeUnsafeAnchors(body);
+        if (FORCE_NO_LINKS) {
+          body = body.replace(/<a\b[^>]*>(.*?)<\/a>/gis, "$1");
+        }
+        // Trim content to max chars
+        if (body.length > CONTENT_MAX_CHARS) {
+          body = body.slice(0, CONTENT_MAX_CHARS) + "…";
+        }
+        // Unwrap anchors inside headings (extra safety)
         body = body.replace(/<(h1|h2|h3|h4|h5|h6)[^>]*>[\s\S]*?<\/\1>/gi, m =>
           m.replace(/<a\b[^>]*>(.*?)<\/a>/gis, "$1")
         );
-
-        // soft cap
-        body = capAnchors(body, MAX_LINKS);
-
-        // hard cap (belt & suspenders): if still too many, unwrap ALL
-        if (anchorCount(body) > MAX_LINKS) {
-          body = body.replace(/<a\b[^>]*>(.*?)<\/a>/gis, "$1");
-        }
-
-        // also unwrap anchors in the last 25% of content (often sources/footers)
-        const cut = Math.floor(body.length * 0.75);
-        body = body.slice(0, cut) +
-               body.slice(cut).replace(/<a\b[^>]*>(.*?)<\/a>/gis, "$1");
-
         return open + body + close;
       }
     );
 
-    // 2) Ensure/sanitize media:thumbnail
+    // THUMBNAIL: prefer existing; else derive; else default
     if (!/<media:thumbnail\b/.test(out)) {
-      const link = (out.match(/<link>([^<]+)<\/link>/)?.[1] || "").split("?")[0];
-      if (link) {
-        try {
-          const pageRes = await fetch(link, { headers: { "Accept": "text/html", "User-Agent": UA } });
-          if (pageRes.ok) {
-            const html = await pageRes.text();
-            const rawOg = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)?.[1];
-            const thumb = sanitizeUrl(rawOg);
-            if (thumb && ALLOWED_IMG_EXT.test(thumb)) {
-              out = out.replace("</item>", `<media:thumbnail url="${thumb}" /></item>`);
+      let thumb = null;
+
+      // 1) RSS media:content or enclosure in item
+      thumb = thumb || out.match(/<media:content[^>]+url=["']([^"']+)["']/i)?.[1] || null;
+      thumb = thumb || out.match(/<enclosure[^>]+url=["']([^"']+)["']/i)?.[1] || null;
+
+      // 2) Fetch article page, read og:image + author
+      if (!thumb) {
+        const link = (out.match(/<link>([^<]+)<\/link>/)?.[1] || "").split("?")[0];
+        if (link) {
+          try {
+            const pageRes = await fetch(link, { headers: { Accept: "text/html", "User-Agent": UA } });
+            if (pageRes.ok) {
+              const html = await pageRes.text();
+              const og = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)?.[1];
+              if (og) thumb = og;
+              // ensure author if missing
+              out = ensureAuthor(out, html);
             }
-            // 2a) Ensure author if missing
-            out = ensureAuthor(out, html);
-          }
-        } catch { /* ignore per-item errors */ }
+          } catch {}
+        }
+      }
+
+      // 3) Fallback default (PNG/JPG only)
+      if (!thumb) thumb = DEFAULT_THUMB_URL;
+
+      const s = sanitizeUrl(thumb);
+      if (s && ALLOWED_IMG_EXT.test(s)) {
+        out = out.replace("</item>", `<media:thumbnail url="${s}" /></item>`);
       }
     } else {
       // sanitize provided thumbnail URL
@@ -116,11 +157,12 @@ async function rewriteItems(xmlStr) {
         const s = sanitizeUrl(u);
         return (s && ALLOWED_IMG_EXT.test(s)) ? `<media:thumbnail url="${s}" />` : "";
       });
-      // 2a) ensure author if missing (fetch page for author)
+
+      // Ensure author if missing (fetch page)
       const link = (out.match(/<link>([^<]+)<\/link>/)?.[1] || "").split("?")[0];
       if (link) {
         try {
-          const pageRes = await fetch(link, { headers: { "Accept": "text/html", "User-Agent": UA } });
+          const pageRes = await fetch(link, { headers: { Accept: "text/html", "User-Agent": UA } });
           if (pageRes.ok) {
             const html = await pageRes.text();
             out = ensureAuthor(out, html);
@@ -129,26 +171,27 @@ async function rewriteItems(xmlStr) {
       }
     }
 
-    // 3) Strip UTM in <link>
+    // Strip UTM params in <link>
     out = out.replace(/<link>([^<]+)<\/link>/, (_, u) => `<link>${stripUtm(u)}</link>`);
 
+    // Replace in XML
     xmlStr = xmlStr.replace(item, out);
   }
   return xmlStr;
 }
 
-// --- helpers ---
+/* ---------------- HELPERS ---------------- */
 
 function ensureAuthor(itemXml, articleHtml) {
   const hasDc = /<dc:creator>[\s\S]*?<\/dc:creator>/i.test(itemXml);
-  const hasAuthor = /<author>[\s\S]*?<\/author>/i.test(itemXml); // RSS 2.0 email format, we’ll use name only
+  const hasAuthor = /<author>[\s\S]*?<\/author>/i.test(itemXml);
   if (hasDc || hasAuthor) return itemXml;
 
-  // Try to find author from meta tags or JSON-LD
+  // Try meta name="author"
   let name = articleHtml?.match(/<meta[^>]+name=["']author["'][^>]+content=["']([^"']+)["']/i)?.[1];
 
+  // Fallback: JSON-LD
   if (!name) {
-    // JSON-LD: "author": {"@type":"Person","name":"..."} or array
     const ldMatches = articleHtml?.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
     for (const block of ldMatches) {
       try {
@@ -160,7 +203,6 @@ function ensureAuthor(itemXml, articleHtml) {
   }
 
   if (name) {
-    // Add both dc:creator and author (name only). Wrap in CDATA to be safe.
     const inject =
       `\n      <dc:creator><![CDATA[${name}]]></dc:creator>\n` +
       `      <author><![CDATA[${name}]]></author>\n`;
@@ -168,34 +210,28 @@ function ensureAuthor(itemXml, articleHtml) {
   }
   return itemXml;
 }
+
 function findAuthorName(obj) {
   if (!obj || typeof obj !== "object") return null;
-  // If array, search elements
   if (Array.isArray(obj)) {
     for (const el of obj) {
       const v = findAuthorName(el);
       if (v) return v;
     }
   }
-  // Direct author field
   if (obj.author) {
-    if (typeof obj.author === "string") return obj.author;
-    if (Array.isArray(obj.author)) {
-      for (const a of obj.author) {
-        const v = findAuthorName(a);
-        if (v) return v;
-      }
-    } else if (obj.author.name) return obj.author.name;
-  }
-  // Article schema
-  if (obj["@type"] && /Article/i.test(obj["@type"]) && obj.author) {
     const a = obj.author;
     if (typeof a === "string") return a;
     if (Array.isArray(a)) {
-      for (const e of a) if (e && e.name) return e.name;
+      for (const e of a) if (e && (e.name || typeof e === "string")) return e.name || e;
     } else if (a.name) return a.name;
   }
-  // Recurse other props
+  if (obj["@type"] && /Article/i.test(obj["@type"]) && obj.author) {
+    const a = obj.author;
+    if (typeof a === "string") return a;
+    if (Array.isArray(a)) for (const e of a) if (e && e.name) return e.name;
+    if (a.name) return a.name;
+  }
   for (const k of Object.keys(obj)) {
     const v = obj[k];
     const found = typeof v === "object" ? findAuthorName(v) : null;
@@ -215,10 +251,26 @@ function stripJunk(html) {
     .replace(/<div[^>]+class=(["']).*?\b(related|share|social|subscribe|breadcrumbs|tags|tag-?cloud|promo|newsletter|author|bio|widget|sidebar|footer|cta|read-?more)\b.*?\1[^>]*>[\s\S]*?<\/div>/gi, "")
     .replace(/<section[^>]+class=(["']).*?\b(related|share|social|subscribe|tags|newsletter|sources|references)\b.*?\1[^>]*>[\s\S]*?<\/section>/gi, "")
     .replace(/<ul[^>]+class=(["']).*?\b(related|share|social|tags|sources|references)\b.*?\1[^>]*>[\s\S]*?<\/ul>/gi, "")
-    // unwrap image-only anchors
+    // unwrap linked images
     .replace(/<a\b[^>]*>\s*(<img[\s\S]*?>)\s*<\/a>/gi, "$1")
     // drop footnote marks like [1]
     .replace(/<sup[^>]*>\s*\[?\d+\]?\s*<\/sup>/gi, "");
+}
+
+function unwrapLowValueAnchors(html) {
+  // unwrap anchors inside low-value containers: figcaption, caption, small, lists, tables
+  html = html.replace(/<(figcaption|caption|small)[^>]*>[\s\S]*?<\/\1>/gi, m =>
+    m.replace(/<a\b[^>]*>(.*?)<\/a>/gis, "$1")
+  );
+  html = html.replace(/<(ul|ol|table)[^>]*>[\s\S]*?<\/\1>/gi, m =>
+    m.replace(/<a\b[^>]*>(.*?)<\/a>/gis, "$1")
+  );
+  // remove “read more / continue / view sources / references / back to top”
+  html = html.replace(
+    /<a\b[^>]*>(\s*(read\s*more|continue|view\s*sources?|sources?|references?|back\s*to\s*top)\s*)<\/a>/gi,
+    (_m, inner) => inner
+  );
+  return html;
 }
 
 function removeUnsafeAnchors(html) {
@@ -227,33 +279,6 @@ function removeUnsafeAnchors(html) {
     /<a\b[^>]*href=["']([^"']*)["'][^>]*>(.*?)<\/a>/gis,
     (m, href, inner) => (/^(mailto:|tel:|javascript:|#)/i.test(href) ? inner : m)
   );
-}
-
-function unwrapLowValueAnchors(html) {
-  // unwrap anchors inside low-value containers: figcaption, caption, small, lists, tables
-  html = html.replace(/<(figcaption|caption|small)[^>]*>[\s\S]*?<\/\1>/gi, (m) =>
-    m.replace(/<a\b[^>]*>(.*?)<\/a>/gis, "$1")
-  );
-  html = html.replace(/<(ul|ol|table)[^>]*>[\s\S]*?<\/\1>/gi, (m) =>
-    m.replace(/<a\b[^>]*>(.*?)<\/a>/gis, "$1")
-  );
-  // remove “read more / continue / back to top / view sources”
-  html = html.replace(
-    /<a\b[^>]*>(\s*(read\s*more|continue|back\s*to\s*top|view\s*sources?|sources?|references?)\s*)<\/a>/gi,
-    (m, inner) => inner
-  );
-  return html;
-}
-
-function capAnchors(html, max) {
-  let i = 0;
-  return html.replace(/<a\b[^>]*>(.*?)<\/a>/gis, (m, inner) => (++i <= max) ? m : inner);
-}
-
-function anchorCount(html) {
-  let count = 0;
-  html.replace(/<a\b[^>]*>(.*?)<\/a>/gis, () => { count++; return ""; });
-  return count;
 }
 
 function stripUtm(u) {
@@ -270,12 +295,8 @@ function sanitizeUrl(u) {
   if (/^(data:|mailto:|tel:|javascript:)/i.test(s)) return null;
   if (!/^https?:\/\//i.test(s)) return null;
   s = s.replace(/^http:\/\//i, "https://");
-  try {
-    const url = new URL(s);
-    return url.toString();
-  } catch {
-    try { return encodeURI(s); } catch { return null; }
-  }
+  try { return new URL(s).toString(); }
+  catch { try { return encodeURI(s); } catch { return null; } }
 }
 
 main().catch(err => {
