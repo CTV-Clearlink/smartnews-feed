@@ -37,6 +37,7 @@ jobs:
           from datetime import datetime, timezone
           import re
           from urllib.parse import quote
+          import html as html_lib
 
           print("Fetching original feed...")
           response = requests.get('https://www.cabletv.com/feed')
@@ -87,16 +88,65 @@ jobs:
           
           cdata_count = 0
           
-          def clean_title(title):
-              """Clean up title - remove shortcodes and fix missing words"""
-              if not title:
-                  return title
-              # Remove shortcodes like [current_date format="mm yy"]
-              title = re.sub(r'\[current_date[^\]]*\]', str(datetime.now().year), title)
-              title = re.sub(r'\[[^\]]+\]', '', title)
-              # Clean up extra spaces
-              title = re.sub(r'\s+', ' ', title).strip()
-              return title
+          def fetch_article_metadata(article_url):
+              """Fetch full title and featured image from article page"""
+              try:
+                  headers = {
+                      'User-Agent': 'Mozilla/5.0 (compatible; SmartFeed-Builder/3.0)',
+                      'Accept': 'text/html'
+                  }
+                  response = requests.get(article_url, headers=headers, timeout=10)
+                  if not response.ok:
+                      return None, None
+                  
+                  html = response.text
+                  
+                  # Get FULL title from og:title or page title
+                  full_title = None
+                  
+                  # Try og:title first (usually cleanest)
+                  og_title_match = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+                  if og_title_match:
+                      full_title = html_lib.unescape(og_title_match.group(1))
+                  
+                  # Fallback to <title> tag
+                  if not full_title:
+                      title_match = re.search(r'<title>([^<]+)</title>', html, re.IGNORECASE)
+                      if title_match:
+                          full_title = html_lib.unescape(title_match.group(1))
+                          # Remove site name suffix (e.g., " - CableTV.com")
+                          full_title = re.sub(r'\s*[-|]\s*CableTV\.com.*$', '', full_title, flags=re.IGNORECASE)
+                  
+                  # Get featured image
+                  featured_image = None
+                  candidates = []
+                  
+                  og_matches = re.findall(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+                  candidates.extend(og_matches)
+                  
+                  twitter_matches = re.findall(r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+                  candidates.extend(twitter_matches)
+                  
+                  for img_url in candidates:
+                      filename = img_url.lower().split('/')[-1]
+                      if 'logo' in filename or 'icon' in filename:
+                          continue
+                      if any(size in img_url.lower() for size in ['150x150', '100x100', '50x50']):
+                          continue
+                      if 'watch-' in filename or filename.endswith('.webp'):
+                          featured_image = img_url
+                          break
+                      if not featured_image:
+                          featured_image = img_url
+                  
+                  if not featured_image and candidates:
+                      featured_image = candidates[0]
+                  
+                  return full_title, featured_image
+                  
+              except Exception as e:
+                  print(f"    ! Error: {e}")
+              return None, None
           
           def clean_content(html):
               """Remove ads, promos, and unnecessary elements from content"""
@@ -105,8 +155,7 @@ jobs:
               
               soup = BeautifulSoup(html, 'html.parser')
               
-              # Remove DirecTV/affiliate ads at top
-              # Look for divs with button/CTA classes that contain affiliate links
+              # Remove DirecTV/affiliate ads
               for div in soup.find_all('div', class_=re.compile(r'(vc_btn|button|cta|promo)', re.I)):
                   if div.find('a', href=re.compile(r'(aff_c|affiliate|go\.cabletv)', re.I)):
                       div.decompose()
@@ -115,32 +164,22 @@ jobs:
               for elem in soup.find_all(['div', 'section', 'aside'], class_=re.compile(r'(newsletter|subscribe|signup|email-form)', re.I)):
                   elem.decompose()
               
-              # Remove any "subscribe" or "newsletter" text blocks
+              # Remove any "subscribe" or "newsletter" blocks
               for elem in soup.find_all(string=re.compile(r'(subscribe|newsletter|sign up|email)', re.I)):
                   parent = elem.parent
                   if parent and parent.name in ['p', 'div', 'span']:
-                      # Check if it's a newsletter promo
                       text = parent.get_text().lower()
                       if 'newsletter' in text or 'subscribe' in text:
                           parent.decompose()
               
-              # Remove social share buttons
-              for elem in soup.find_all(['div', 'section'], class_=re.compile(r'(share|social)', re.I)):
+              # Remove social share, related articles, nav, footer, header
+              for elem in soup.find_all(['div', 'section'], class_=re.compile(r'(share|social|related|similar|recommended)', re.I)):
                   elem.decompose()
               
-              # Remove "related articles" sections
-              for elem in soup.find_all(['div', 'section', 'aside'], class_=re.compile(r'(related|similar|recommended)', re.I)):
-                  elem.decompose()
-              
-              # Remove navigation, footer, header
-              for tag in soup.find_all(['nav', 'footer', 'header', 'aside']):
+              for tag in soup.find_all(['nav', 'footer', 'header', 'aside', 'script', 'style']):
                   tag.decompose()
               
-              # Remove scripts and styles
-              for tag in soup.find_all(['script', 'style']):
-                  tag.decompose()
-              
-              # Limit number of links (keep only first 3)
+              # Limit links
               links = soup.find_all('a')
               if len(links) > 3:
                   for link in links[3:]:
@@ -148,68 +187,40 @@ jobs:
               
               return str(soup)
           
-          def fetch_featured_image(article_url):
-              """Fetch the featured image from the article page"""
-              try:
-                  headers = {
-                      'User-Agent': 'Mozilla/5.0 (compatible; SmartFeed-Builder/3.0)',
-                      'Accept': 'text/html'
-                  }
-                  response = requests.get(article_url, headers=headers, timeout=10)
-                  if not response.ok:
-                      return None
-                  
-                  html = response.text
-                  candidates = []
-                  
-                  # Look for og:image, twitter:image, article:image
-                  og_matches = re.findall(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
-                  candidates.extend(og_matches)
-                  
-                  twitter_matches = re.findall(r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
-                  candidates.extend(twitter_matches)
-                  
-                  article_matches = re.findall(r'<meta[^>]+property=["\']article:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
-                  candidates.extend(article_matches)
-                  
-                  # Filter and select best image
-                  for img_url in candidates:
-                      filename = img_url.lower().split('/')[-1]
-                      
-                      if 'logo' in filename or 'icon' in filename:
-                          continue
-                      if any(size in img_url.lower() for size in ['150x150', '100x100', '50x50']):
-                          continue
-                      if 'watch-' in filename or filename.endswith('.webp'):
-                          return img_url
-                      return img_url
-                  
-                  if candidates:
-                      return candidates[0]
-                  
-                  return None
-              except Exception as e:
-                  print(f"    ! Error: {e}")
-              return None
-          
           for idx, item in enumerate(items):
-              title_elem = item.find('title')
-              title_text = title_elem.text if title_elem is not None else 'Unknown'
+              article_link = None
               
-              # Clean the title
-              cleaned_title = clean_title(title_text)
-              print(f"\nItem {idx+1}: {cleaned_title[:50]}")
+              # Get article link first
+              for elem in item:
+                  if elem.tag == 'link':
+                      article_link = elem.text.split('?')[0] if elem.text else None
+                      break
+              
+              # Fetch FULL title and image from article page
+              full_title = None
+              featured_image = None
+              
+              if article_link:
+                  print(f"\nItem {idx+1}: Fetching from {article_link}")
+                  full_title, featured_image = fetch_article_metadata(article_link)
+              
+              # Fallback to RSS title if needed
+              if not full_title:
+                  title_elem = item.find('title')
+                  full_title = title_elem.text if title_elem is not None else 'Unknown'
+                  # Clean shortcodes from RSS title
+                  full_title = re.sub(r'\[current_date[^\]]*\]', str(datetime.now().year), full_title)
+                  full_title = re.sub(r'\[[^\]]+\]', '', full_title)
+                  full_title = re.sub(r'\s+', ' ', full_title).strip()
+              
+              print(f"  Title: {full_title}")
               
               xml_parts.append('<item>')
               
               original_content = None
-              article_link = None
               
-              # Get link and content
+              # Get content
               for elem in item:
-                  if elem.tag == 'link':
-                      article_link = elem.text.split('?')[0] if elem.text else None
-                  
                   tag_name = etree.QName(elem.tag).localname if '}' in elem.tag else elem.tag
                   namespace = etree.QName(elem.tag).namespace if '}' in elem.tag else None
                   
@@ -225,19 +236,15 @@ jobs:
                   if namespace == 'http://search.yahoo.com/mrss/':
                       continue
                   
-                  # Replace title with cleaned version
+                  # Replace title with FULL title from article page
                   if elem.tag == 'title':
-                      xml_parts.append(f'<title><![CDATA[{cleaned_title}]]></title>')
+                      xml_parts.append(f'<title><![CDATA[{full_title}]]></title>')
                   # Clean content
                   elif namespace == 'http://purl.org/rss/1.0/modules/content/' and tag_name == 'encoded':
                       if original_content:
-                          # Clean the content - remove ads, promos, etc.
                           cleaned_content = clean_content(original_content)
-                          
-                          # DO NOT truncate - include full content
                           xml_parts.append(f'<content:encoded><![CDATA[{cleaned_content}]]></content:encoded>')
                           cdata_count += 1
-                          print(f"  Content length: {len(cleaned_content)} chars (full article)")
                   else:
                       xml_parts.append(etree.tostring(elem, encoding='unicode', method='xml'))
               
@@ -248,11 +255,7 @@ jobs:
               if item.find('pubDate') is None:
                   xml_parts.append(f'<pubDate>{datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")}</pubDate>')
               
-              # Fetch featured image
-              featured_image = None
-              if article_link:
-                  featured_image = fetch_featured_image(article_link)
-              
+              # Use featured image or fallback
               if not featured_image:
                   featured_image = fallback_thumbnail
               
@@ -274,7 +277,7 @@ jobs:
               f.write(xml_string)
           
           print(f"\n✓ Feed created with {cdata_count} CDATA sections")
-          print(f"✓ Full article content included (not truncated)")
+          print(f"✓ Full titles fetched from article pages")
           print(f"✓ Output size: {len(xml_string):,} bytes")
           EOF
       
