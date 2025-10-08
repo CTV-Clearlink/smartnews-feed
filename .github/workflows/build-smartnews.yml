@@ -35,131 +35,137 @@ jobs:
           from lxml import etree
           from bs4 import BeautifulSoup
           from datetime import datetime, timezone
-          import re
           import time
 
+          print("Fetching RSS feed...")
           response = requests.get('https://www.cabletv.com/feed')
           root = etree.fromstring(response.content)
           channel = root.find('channel')
           items = channel.findall('item')[:8]
           
-          nsmap = {
-              'content': 'http://purl.org/rss/1.0/modules/content/',
-              'dc': 'http://purl.org/dc/elements/1.1/',
-              'media': 'http://search.yahoo.com/mrss/',
-              'snf': 'http://www.smartnews.be/snf'
-          }
+          print(f"Found {len(items)} items")
           
-          for prefix, uri in nsmap.items():
-              etree.register_namespace(prefix, uri)
+          fallback_img = 'https://ctv-clearlink.github.io/RSS-Feed/CableTV.com%20RSS%20Logo%20Header.png'
           
-          fallback = 'https://ctv-clearlink.github.io/RSS-Feed/CableTV.com%20RSS%20Logo%20Header.png'
+          # Start building XML manually
+          output = ['<?xml version="1.0" encoding="UTF-8"?>']
+          output.append('<rss version="2.0"')
+          output.append(' xmlns:content="http://purl.org/rss/1.0/modules/content/"')
+          output.append(' xmlns:dc="http://purl.org/dc/elements/1.1/"')
+          output.append(' xmlns:media="http://search.yahoo.com/mrss/"')
+          output.append(' xmlns:snf="http://www.smartnews.be/snf">')
+          output.append('<channel>')
+          output.append(f'<snf:logo><url>{fallback_img}</url></snf:logo>')
           
-          xml_parts = []
-          xml_parts.append('<?xml version="1.0" encoding="UTF-8"?>')
-          xml_parts.append('<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:media="http://search.yahoo.com/mrss/" xmlns:snf="http://www.smartnews.be/snf">')
-          xml_parts.append('<channel>')
-          xml_parts.append(f'<snf:logo><url>{fallback}</url></snf:logo>')
-          
+          # Copy channel metadata
           for elem in channel:
               if elem.tag == 'item':
                   break
-              if 'logo' not in elem.tag.lower():
-                  xml_parts.append(etree.tostring(elem, encoding='unicode'))
+              if 'logo' not in str(elem.tag).lower():
+                  output.append(etree.tostring(elem, encoding='unicode'))
           
-          for idx, item in enumerate(items):
-              link = item.find('link').text.strip().split('?')[0]
-              print(f"\n{idx+1}. {link}")
-              
-              # Fetch page and extract EVERYTHING
-              title = None
-              image = None
-              full_content = None
-              
-              try:
-                  r = requests.get(link, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
-                  soup = BeautifulSoup(r.text, 'html.parser')
+          # Process each item
+          for idx, item in enumerate(items, 1):
+              link_elem = item.find('link')
+              if link_elem is None or link_elem.text is None:
+                  continue
                   
-                  # Get title from og:title meta tag
-                  meta_title = soup.find('meta', property='og:title')
-                  if meta_title and meta_title.get('content'):
-                      title = meta_title['content']
-                      print(f"  Title: {title}")
-                  
-                  # Get image from og:image
-                  meta_image = soup.find('meta', property='og:image')
-                  if meta_image and meta_image.get('content'):
-                      img = meta_image['content']
-                      if 'logo' not in img.lower():
-                          image = img
-                          print(f"  Image: {img.split('/')[-1]}")
-                  
-                  # Get FULL article content
-                  article_tag = soup.find('article')
-                  if article_tag:
-                      # Remove unwanted tags
-                      for tag in article_tag.find_all(['script', 'style', 'nav', 'footer', 'header']):
-                          tag.decompose()
-                      # Remove forms
-                      for form in article_tag.find_all('form'):
-                          form.decompose()
-                      
-                      full_content = str(article_tag)
-                      print(f"  Content: {len(full_content)} chars")
-                  
-                  time.sleep(0.3)
-              except Exception as e:
-                  print(f"  Error: {e}")
+              link = link_elem.text.strip().split('?')[0]
+              print(f"\n[{idx}] {link}")
               
-              # Fallbacks
-              if not title:
-                  title = item.find('title').text
-              if not image:
-                  image = fallback
-              if not full_content:
-                  # Use RSS content as absolute fallback
-                  for elem in item:
-                      if elem.tag == '{http://purl.org/rss/1.0/modules/content/}encoded':
-                          full_content = elem.text or ''
-                          break
+              # Get RSS fallbacks
+              rss_title = item.find('title')
+              title = rss_title.text if rss_title is not None else "Unknown"
               
-              # Build XML for this item
-              xml_parts.append('<item>')
-              xml_parts.append(f'<title><![CDATA[{title}]]></title>')
+              image = fallback_img
+              content = ""
               
-              # Add all other RSS elements except title, content, and media
+              # Get RSS content as fallback
               for elem in item:
-                  tag = elem.tag
-                  if tag == 'title':
-                      continue
-                  if tag == '{http://purl.org/rss/1.0/modules/content/}encoded':
-                      continue
-                  if '{http://search.yahoo.com/mrss/}' in tag:
-                      continue
-                  xml_parts.append(etree.tostring(elem, encoding='unicode'))
+                  if 'encoded' in str(elem.tag):
+                      content = elem.text if elem.text else ""
+                      break
               
-              # Add the FULL content
-              xml_parts.append(f'<content:encoded><![CDATA[{full_content}]]></content:encoded>')
+              # Scrape the page
+              try:
+                  page = requests.get(link, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}, timeout=15)
+                  
+                  if page.status_code == 200:
+                      soup = BeautifulSoup(page.text, 'html.parser')
+                      
+                      # Extract og:title
+                      og_title = soup.find('meta', attrs={'property': 'og:title'})
+                      if og_title and og_title.get('content'):
+                          title = og_title['content']
+                          print(f"  ✓ Title: {title}")
+                      else:
+                          print(f"  ✗ No og:title, using RSS: {title}")
+                      
+                      # Extract og:image
+                      og_img = soup.find('meta', attrs={'property': 'og:image'})
+                      if og_img and og_img.get('content'):
+                          img_url = og_img['content']
+                          if 'logo' not in img_url.lower() and 'icon' not in img_url.lower():
+                              image = img_url
+                              print(f"  ✓ Image: .../{img_url.split('/')[-1]}")
+                      
+                      # Extract article content
+                      article = soup.find('article')
+                      if article:
+                          # Remove unwanted elements
+                          for unwanted in article.find_all(['script', 'style', 'nav', 'footer', 'header', 'aside']):
+                              unwanted.decompose()
+                          
+                          # Remove forms
+                          for form in article.find_all('form'):
+                              form.decompose()
+                          
+                          # Convert to string
+                          content = str(article)
+                          print(f"  ✓ Content: {len(content):,} characters")
+                      else:
+                          print(f"  ✗ No article tag, using RSS content ({len(content)} chars)")
+                  else:
+                      print(f"  ✗ HTTP {page.status_code}")
+                  
+                  time.sleep(0.5)
+                  
+              except Exception as e:
+                  print(f"  ✗ Error: {str(e)[:100]}")
               
-              # Add missing fields
-              if item.find('{http://purl.org/dc/elements/1.1/}creator') is None:
-                  xml_parts.append('<dc:creator>CableTV.com</dc:creator>')
-              if item.find('pubDate') is None:
-                  xml_parts.append(f'<pubDate>{datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")}</pubDate>')
+              # Build item XML
+              output.append('<item>')
+              output.append(f'<title><![CDATA[{title}]]></title>')
               
-              # Add image
-              xml_parts.append(f'<media:thumbnail url="{image}"/>')
-              xml_parts.append('</item>')
+              # Copy other RSS elements (skip title, content:encoded, media:thumbnail)
+              for elem in item:
+                  tag_str = str(elem.tag)
+                  if elem.tag == 'title':
+                      continue
+                  if 'encoded' in tag_str or 'thumbnail' in tag_str:
+                      continue
+                  output.append(etree.tostring(elem, encoding='unicode'))
+              
+              # Add content
+              output.append(f'<content:encoded><![CDATA[{content}]]></content:encoded>')
+              
+              # Add media thumbnail
+              safe_image = image.replace('&', '&amp;')
+              output.append(f'<media:thumbnail url="{safe_image}"/>')
+              
+              output.append('</item>')
           
-          xml_parts.append('</channel></rss>')
+          output.append('</channel>')
+          output.append('</rss>')
           
-          xml_string = ''.join(xml_parts)
-          xml_string = xml_string.replace('https://www.cabletv.com/feed', 'https://ctv-clearlink.github.io/RSS-Feed/feed.xml')
+          final_xml = ''.join(output)
+          final_xml = final_xml.replace('https://www.cabletv.com/feed', 'https://ctv-clearlink.github.io/RSS-Feed/feed.xml')
           
+          # Write to file
           with open('feed.xml', 'w', encoding='utf-8') as f:
-              f.write(xml_string)
+              f.write(final_xml)
           
-          print(f"\nDone: {len(xml_string):,} bytes")
+          print(f"\n✅ Feed created: {len(final_xml):,} bytes")
           EOF
       
       - name: Check for changes
@@ -173,6 +179,6 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
           git add feed.xml
-          git commit -m "Update feed"
+          git commit -m "Update RSS feed"
           git pull --rebase origin main
           git push origin main
