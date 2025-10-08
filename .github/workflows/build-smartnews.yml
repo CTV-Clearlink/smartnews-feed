@@ -38,6 +38,7 @@ jobs:
           import re
           from urllib.parse import quote
           import html as html_lib
+          import time
 
           print("Fetching original feed...")
           response = requests.get('https://www.cabletv.com/feed')
@@ -76,7 +77,7 @@ jobs:
           xml_parts.append(' xmlns:snf="http://www.smartnews.be/snf">')
           xml_parts.append('<channel>')
           
-          # Add logo first
+          # Add logo
           xml_parts.append(f'<snf:logo><url>{logo_url}</url></snf:logo>')
           
           # Add channel metadata
@@ -86,160 +87,115 @@ jobs:
               if 'logo' not in elem.tag.lower():
                   xml_parts.append(etree.tostring(elem, encoding='unicode', method='xml'))
           
-          cdata_count = 0
-          
-          def scrape_full_article(article_url):
-              """Scrape the FULL article content, title, and featured image from the page"""
+          def scrape_article(url):
+              """Scrape full article from page"""
               try:
-                  headers = {
-                      'User-Agent': 'Mozilla/5.0 (compatible; SmartFeed-Builder/3.0)',
-                      'Accept': 'text/html'
-                  }
-                  response = requests.get(article_url, headers=headers, timeout=15)
-                  if not response.ok:
+                  headers = {'User-Agent': 'Mozilla/5.0 (compatible; SmartFeed-Builder/3.0)'}
+                  r = requests.get(url, headers=headers, timeout=15)
+                  if not r.ok:
                       return None, None, None
                   
-                  html_content = response.text
-                  soup = BeautifulSoup(html_content, 'html.parser')
+                  soup = BeautifulSoup(r.text, 'html.parser')
                   
-                  # Get FULL title
-                  full_title = None
-                  og_title_match = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html_content, re.IGNORECASE)
-                  if og_title_match:
-                      full_title = html_lib.unescape(og_title_match.group(1))
+                  # Get title from og:title
+                  title = None
+                  og_title = soup.find('meta', property='og:title')
+                  if og_title and og_title.get('content'):
+                      title = html_lib.unescape(og_title.get('content'))
                   
-                  if not full_title:
-                      title_tag = soup.find('title')
-                      if title_tag:
-                          full_title = html_lib.unescape(title_tag.get_text())
-                          full_title = re.sub(r'\s*[-|]\s*CableTV\.com.*$', '', full_title, flags=re.IGNORECASE)
+                  # Get image from og:image
+                  image = None
+                  og_image = soup.find('meta', property='og:image')
+                  if og_image and og_image.get('content'):
+                      img = og_image.get('content')
+                      if 'logo' not in img.lower() and 'icon' not in img.lower():
+                          image = img
                   
-                  # Get featured image
-                  featured_image = None
-                  og_matches = re.findall(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html_content, re.IGNORECASE)
+                  # Get FULL article content
+                  article = soup.find('article')
+                  if not article:
+                      article = soup.find('div', class_=re.compile(r'entry-content|post-content', re.I))
                   
-                  for img_url in og_matches:
-                      filename = img_url.lower().split('/')[-1]
-                      if 'logo' not in filename and 'icon' not in filename:
-                          featured_image = img_url
-                          break
-                  
-                  # Extract FULL article
-                  article_body = None
-                  
-                  # Try different selectors
-                  selectors = [
-                      ('article', {}),
-                      ('div', {'class': re.compile(r'entry-content', re.I)}),
-                      ('div', {'class': re.compile(r'article-content', re.I)}),
-                      ('div', {'class': re.compile(r'post-content', re.I)}),
-                      ('main', {}),
-                  ]
-                  
-                  for tag, attrs in selectors:
-                      article_body = soup.find(tag, attrs) if attrs else soup.find(tag)
-                      if article_body:
-                          break
-                  
-                  if article_body:
-                      # Make a copy to clean
-                      article_body = BeautifulSoup(str(article_body), 'html.parser')
-                      
+                  if article:
                       # Remove unwanted elements
-                      for unwanted in article_body.find_all(['script', 'style', 'nav', 'footer', 'aside', 'header']):
-                          unwanted.decompose()
+                      for tag in article.find_all(['script', 'style', 'nav', 'footer', 'aside', 'header']):
+                          tag.decompose()
                       
-                      # Remove ads with affiliate links - FIXED: check if div exists
-                      for div in article_body.find_all('div'):
-                          if not div:
-                              continue
-                          link = div.find('a', href=re.compile(r'(aff_c|affiliate|go\.cabletv)', re.I))
-                          if link:
-                              classes = div.get('class', [])
-                              if classes and any(x in ' '.join(classes).lower() for x in ['btn', 'button', 'cta']):
+                      # Remove affiliate CTAs
+                      for div in article.find_all('div'):
+                          if div.find('a', href=re.compile(r'(aff_c|go\.cabletv)', re.I)):
+                              classes = ' '.join(div.get('class', []))
+                              if any(x in classes for x in ['btn', 'button', 'cta']):
                                   div.decompose()
                       
-                      # Remove newsletter/subscribe sections - FIXED
-                      for elem in article_body.find_all(['div', 'section', 'aside']):
-                          if not elem:
-                              continue
-                          classes = elem.get('class', [])
-                          if classes and any(x in ' '.join(classes).lower() for x in ['newsletter', 'subscribe', 'signup']):
+                      # Remove newsletter/subscribe
+                      for elem in article.find_all(['div', 'section', 'aside']):
+                          classes = ' '.join(elem.get('class', []))
+                          if any(x in classes for x in ['newsletter', 'subscribe', 'email']):
                               elem.decompose()
                       
-                      # Remove social shares - FIXED
-                      for elem in article_body.find_all(['div', 'section']):
-                          if not elem:
-                              continue
-                          classes = elem.get('class', [])
-                          if classes and any(x in ' '.join(classes).lower() for x in ['share', 'social']):
-                              elem.decompose()
+                      # Limit links to 3
+                      links = article.find_all('a')
+                      for link in links[3:]:
+                          link.unwrap()
                       
-                      # Limit links
-                      links = article_body.find_all('a')
-                      if len(links) > 3:
-                          for link in links[3:]:
-                              link.unwrap()
-                      
-                      full_content = str(article_body)
-                      return full_title, featured_image, full_content
+                      content = str(article)
+                      return title, image, content
                   
-                  return full_title, featured_image, None
-                  
+                  return title, image, None
               except Exception as e:
-                  print(f"    ! Error: {e}")
+                  print(f"  Error scraping: {e}")
                   return None, None, None
           
           for idx, item in enumerate(items):
-              article_link = None
-              rss_title_elem = item.find('title')
-              rss_title = rss_title_elem.text if rss_title_elem is not None else 'Unknown'
+              # Get link
+              link_elem = item.find('link')
+              article_link = link_elem.text.split('?')[0] if link_elem is not None and link_elem.text else None
               
-              # Get article link
-              for elem in item:
-                  if elem.tag == 'link':
-                      article_link = elem.text.split('?')[0] if elem.text else None
-                      break
+              print(f"\nProcessing item {idx+1}: {article_link}")
               
-              print(f"\nItem {idx+1}: {rss_title}")
-              
-              # Scrape FULL article
-              full_title = None
-              featured_image = None
-              full_article_content = None
-              
+              # Scrape article
+              title, image, content = None, None, None
               if article_link:
-                  full_title, featured_image, full_article_content = scrape_full_article(article_link)
+                  title, image, content = scrape_article(article_link)
+                  time.sleep(0.5)  # Be nice to the server
               
-              # Use scraped title if available, otherwise RSS
-              if not full_title:
-                  full_title = rss_title
-                  # Clean RSS title
-                  full_title = re.sub(r'\[current_date[^\]]*\]', str(datetime.now().year), full_title)
-                  full_title = re.sub(r'\[[^\]]+\]', '', full_title)
-                  full_title = re.sub(r'\s+', ' ', full_title).strip()
+              # Fallback to RSS if scraping failed
+              if not title:
+                  title_elem = item.find('title')
+                  title = title_elem.text if title_elem is not None else 'Unknown'
+                  title = re.sub(r'\[current_date[^\]]*\]', str(datetime.now().year), title)
+                  title = re.sub(r'\[[^\]]+\]', '', title)
               
-              print(f"  → Title: {full_title}")
-              
-              # Fallback to RSS content if scraping failed
-              if not full_article_content:
-                  print(f"  → Using truncated RSS content")
+              if not content:
                   for elem in item:
                       tag_name = etree.QName(elem.tag).localname if '}' in elem.tag else elem.tag
                       namespace = etree.QName(elem.tag).namespace if '}' in elem.tag else None
-                      
                       if namespace == 'http://purl.org/rss/1.0/modules/content/' and tag_name == 'encoded':
-                          full_article_content = elem.text or ''
+                          content = elem.text or ''
                           break
-              else:
-                  print(f"  → Full content: {len(full_article_content)} chars")
               
+              if not image:
+                  image = fallback_thumbnail
+              
+              # Ensure image is full URL
+              if not image.startswith('http'):
+                  if image.startswith('//'):
+                      image = 'https:' + image
+                  elif image.startswith('/'):
+                      image = 'https://www.cabletv.com' + image
+              
+              image = image.replace('&', '&amp;')
+              
+              print(f"  Title: {title[:50]}")
+              print(f"  Content: {len(content)} chars")
+              print(f"  Image: {image.split('/')[-1]}")
+              
+              # Build item XML
               xml_parts.append('<item>')
+              xml_parts.append(f'<title><![CDATA[{title}]]></title>')
               
-              # Add title
-              xml_parts.append(f'<title><![CDATA[{full_title}]]></title>')
-              
-              # Process other RSS elements
+              # Add other RSS elements (skip title, content, media)
               for elem in item:
                   tag_name = etree.QName(elem.tag).localname if '}' in elem.tag else elem.tag
                   namespace = etree.QName(elem.tag).namespace if '}' in elem.tag else None
@@ -254,30 +210,16 @@ jobs:
                   xml_parts.append(etree.tostring(elem, encoding='unicode', method='xml'))
               
               # Add content
-              if full_article_content:
-                  xml_parts.append(f'<content:encoded><![CDATA[{full_article_content}]]></content:encoded>')
-                  cdata_count += 1
+              xml_parts.append(f'<content:encoded><![CDATA[{content}]]></content:encoded>')
               
               # Add required fields
               if item.find('dc:creator', nsmap) is None:
                   xml_parts.append('<dc:creator>CableTV.com</dc:creator>')
-              
               if item.find('pubDate') is None:
                   xml_parts.append(f'<pubDate>{datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")}</pubDate>')
               
               # Add image
-              if not featured_image:
-                  featured_image = fallback_thumbnail
-              
-              if not featured_image.startswith('http'):
-                  if featured_image.startswith('//'):
-                      featured_image = 'https:' + featured_image
-                  elif featured_image.startswith('/'):
-                      featured_image = 'https://www.cabletv.com' + featured_image
-              
-              featured_image = featured_image.replace('&', '&amp;')
-              
-              xml_parts.append(f'<media:thumbnail url="{featured_image}"/>')
+              xml_parts.append(f'<media:thumbnail url="{image}"/>')
               xml_parts.append('</item>')
           
           xml_parts.append('</channel></rss>')
@@ -286,8 +228,7 @@ jobs:
           with open('feed.xml', 'w', encoding='utf-8') as f:
               f.write(xml_string)
           
-          print(f"\n✓ Feed created with {cdata_count} items")
-          print(f"✓ Output size: {len(xml_string):,} bytes ({len(xml_string)/1024/1024:.2f} MB)")
+          print(f"\n✓ Feed created: {len(xml_string):,} bytes")
           EOF
       
       - name: Check for changes
