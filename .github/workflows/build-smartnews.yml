@@ -95,10 +95,8 @@ jobs:
                       'User-Agent': 'Mozilla/5.0 (compatible; SmartFeed-Builder/3.0)',
                       'Accept': 'text/html'
                   }
-                  print(f"    Fetching page...")
                   response = requests.get(article_url, headers=headers, timeout=15)
                   if not response.ok:
-                      print(f"    ! HTTP {response.status_code}")
                       return None, None, None
                   
                   html_content = response.text
@@ -109,14 +107,12 @@ jobs:
                   og_title_match = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html_content, re.IGNORECASE)
                   if og_title_match:
                       full_title = html_lib.unescape(og_title_match.group(1))
-                      print(f"    Found og:title: {full_title}")
                   
                   if not full_title:
                       title_tag = soup.find('title')
                       if title_tag:
                           full_title = html_lib.unescape(title_tag.get_text())
                           full_title = re.sub(r'\s*[-|]\s*CableTV\.com.*$', '', full_title, flags=re.IGNORECASE)
-                          print(f"    Using page title: {full_title}")
                   
                   # Get featured image
                   featured_image = None
@@ -126,54 +122,57 @@ jobs:
                       filename = img_url.lower().split('/')[-1]
                       if 'logo' not in filename and 'icon' not in filename:
                           featured_image = img_url
-                          print(f"    Found image: {filename}")
                           break
                   
-                  # Extract FULL article - try multiple selectors
+                  # Extract FULL article
                   article_body = None
                   
-                  # Try different selectors for article content
+                  # Try different selectors
                   selectors = [
                       ('article', {}),
                       ('div', {'class': re.compile(r'entry-content', re.I)}),
                       ('div', {'class': re.compile(r'article-content', re.I)}),
                       ('div', {'class': re.compile(r'post-content', re.I)}),
-                      ('div', {'class': re.compile(r'content', re.I)}),
                       ('main', {}),
                   ]
                   
                   for tag, attrs in selectors:
                       article_body = soup.find(tag, attrs) if attrs else soup.find(tag)
                       if article_body:
-                          print(f"    Found content in <{tag}>")
                           break
                   
                   if article_body:
-                      # Clone it so we can clean without affecting original
+                      # Make a copy to clean
                       article_body = BeautifulSoup(str(article_body), 'html.parser')
                       
                       # Remove unwanted elements
                       for unwanted in article_body.find_all(['script', 'style', 'nav', 'footer', 'aside', 'header']):
                           unwanted.decompose()
                       
-                      # Remove ads with affiliate links
+                      # Remove ads with affiliate links - FIXED: check if div exists
                       for div in article_body.find_all('div'):
-                          if div.find('a', href=re.compile(r'(aff_c|affiliate|go\.cabletv)', re.I)):
-                              # Check if it's a button/CTA
-                              classes = ' '.join(div.get('class', []))
-                              if any(x in classes.lower() for x in ['btn', 'button', 'cta']):
+                          if not div:
+                              continue
+                          link = div.find('a', href=re.compile(r'(aff_c|affiliate|go\.cabletv)', re.I))
+                          if link:
+                              classes = div.get('class', [])
+                              if classes and any(x in ' '.join(classes).lower() for x in ['btn', 'button', 'cta']):
                                   div.decompose()
                       
-                      # Remove newsletter/subscribe sections
+                      # Remove newsletter/subscribe sections - FIXED
                       for elem in article_body.find_all(['div', 'section', 'aside']):
-                          classes = ' '.join(elem.get('class', []))
-                          if any(x in classes.lower() for x in ['newsletter', 'subscribe', 'signup']):
+                          if not elem:
+                              continue
+                          classes = elem.get('class', [])
+                          if classes and any(x in ' '.join(classes).lower() for x in ['newsletter', 'subscribe', 'signup']):
                               elem.decompose()
                       
-                      # Remove social shares
+                      # Remove social shares - FIXED
                       for elem in article_body.find_all(['div', 'section']):
-                          classes = ' '.join(elem.get('class', []))
-                          if any(x in classes.lower() for x in ['share', 'social']):
+                          if not elem:
+                              continue
+                          classes = elem.get('class', [])
+                          if classes and any(x in ' '.join(classes).lower() for x in ['share', 'social']):
                               elem.decompose()
                       
                       # Limit links
@@ -183,23 +182,16 @@ jobs:
                               link.unwrap()
                       
                       full_content = str(article_body)
-                      print(f"    Extracted {len(full_content)} chars of content")
                       return full_title, featured_image, full_content
-                  else:
-                      print(f"    ! Could not find article body")
                   
                   return full_title, featured_image, None
                   
               except Exception as e:
                   print(f"    ! Error: {e}")
-                  import traceback
-                  traceback.print_exc()
                   return None, None, None
           
           for idx, item in enumerate(items):
               article_link = None
-              
-              # Get RSS title first for logging
               rss_title_elem = item.find('title')
               rss_title = rss_title_elem.text if rss_title_elem is not None else 'Unknown'
               
@@ -209,9 +201,7 @@ jobs:
                       article_link = elem.text.split('?')[0] if elem.text else None
                       break
               
-              print(f"\n{'='*70}")
-              print(f"Item {idx+1}: {rss_title}")
-              print(f"Link: {article_link}")
+              print(f"\nItem {idx+1}: {rss_title}")
               
               # Scrape FULL article
               full_title = None
@@ -221,13 +211,19 @@ jobs:
               if article_link:
                   full_title, featured_image, full_article_content = scrape_full_article(article_link)
               
-              # Fallback to RSS data if scraping failed
+              # Use scraped title if available, otherwise RSS
               if not full_title:
                   full_title = rss_title
-                  print(f"    Using RSS title: {full_title}")
+                  # Clean RSS title
+                  full_title = re.sub(r'\[current_date[^\]]*\]', str(datetime.now().year), full_title)
+                  full_title = re.sub(r'\[[^\]]+\]', '', full_title)
+                  full_title = re.sub(r'\s+', ' ', full_title).strip()
               
+              print(f"  → Title: {full_title}")
+              
+              # Fallback to RSS content if scraping failed
               if not full_article_content:
-                  print(f"    Using RSS content (will be truncated)")
+                  print(f"  → Using truncated RSS content")
                   for elem in item:
                       tag_name = etree.QName(elem.tag).localname if '}' in elem.tag else elem.tag
                       namespace = etree.QName(elem.tag).namespace if '}' in elem.tag else None
@@ -235,13 +231,15 @@ jobs:
                       if namespace == 'http://purl.org/rss/1.0/modules/content/' and tag_name == 'encoded':
                           full_article_content = elem.text or ''
                           break
+              else:
+                  print(f"  → Full content: {len(full_article_content)} chars")
               
               xml_parts.append('<item>')
               
               # Add title
               xml_parts.append(f'<title><![CDATA[{full_title}]]></title>')
               
-              # Process other RSS elements (skip content and thumbnails)
+              # Process other RSS elements
               for elem in item:
                   tag_name = etree.QName(elem.tag).localname if '}' in elem.tag else elem.tag
                   namespace = etree.QName(elem.tag).namespace if '}' in elem.tag else None
@@ -288,8 +286,7 @@ jobs:
           with open('feed.xml', 'w', encoding='utf-8') as f:
               f.write(xml_string)
           
-          print(f"\n{'='*70}")
-          print(f"✓ Feed created with {cdata_count} items")
+          print(f"\n✓ Feed created with {cdata_count} items")
           print(f"✓ Output size: {len(xml_string):,} bytes ({len(xml_string)/1024/1024:.2f} MB)")
           EOF
       
