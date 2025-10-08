@@ -36,6 +36,7 @@ jobs:
           from bs4 import BeautifulSoup
           from datetime import datetime, timezone
           import time
+          import re
 
           print("Fetching RSS feed...")
           response = requests.get('https://www.cabletv.com/feed')
@@ -91,25 +92,35 @@ jobs:
                   page = requests.get(link, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}, timeout=15)
                   
                   if page.status_code == 200:
-                      soup = BeautifulSoup(page.text, 'html.parser')
+                      html = page.text
                       
-                      # Extract og:title
-                      og_title = soup.find('meta', attrs={'property': 'og:title'})
-                      if og_title and og_title.get('content'):
-                          title = og_title['content']
+                      # Extract og:title using REGEX (more reliable than BeautifulSoup for meta tags)
+                      title_match = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+                      if not title_match:
+                          # Try reverse order (content before property)
+                          title_match = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']', html, re.IGNORECASE)
+                      
+                      if title_match:
+                          title = title_match.group(1)
+                          # Decode HTML entities
+                          title = title.replace('&amp;', '&').replace('&#8217;', "'").replace('&#8211;', '–').replace('&#8212;', '—')
                           print(f"  ✓ Title: {title}")
                       else:
-                          print(f"  ✗ No og:title, using RSS: {title}")
+                          print(f"  ✗ No og:title found, using RSS: {title}")
                       
-                      # Extract og:image
-                      og_img = soup.find('meta', attrs={'property': 'og:image'})
-                      if og_img and og_img.get('content'):
-                          img_url = og_img['content']
+                      # Extract og:image using REGEX
+                      img_match = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+                      if not img_match:
+                          img_match = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html, re.IGNORECASE)
+                      
+                      if img_match:
+                          img_url = img_match.group(1)
                           if 'logo' not in img_url.lower() and 'icon' not in img_url.lower():
                               image = img_url
                               print(f"  ✓ Image: .../{img_url.split('/')[-1]}")
                       
-                      # Extract article content
+                      # Extract article content using BeautifulSoup
+                      soup = BeautifulSoup(html, 'html.parser')
                       article = soup.find('article')
                       if article:
                           # Remove unwanted elements
