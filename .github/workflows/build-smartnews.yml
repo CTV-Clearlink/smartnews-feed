@@ -37,8 +37,6 @@ jobs:
           from datetime import datetime, timezone
           import re
           from urllib.parse import quote
-          import html as html_lib
-          import time
 
           response = requests.get('https://www.cabletv.com/feed')
           root = etree.fromstring(response.content)
@@ -47,11 +45,7 @@ jobs:
           
           nsmap = {
               'content': 'http://purl.org/rss/1.0/modules/content/',
-              'wfw': 'http://wellformedweb.org/CommentAPI/',
               'dc': 'http://purl.org/dc/elements/1.1/',
-              'atom': 'http://www.w3.org/2005/Atom',
-              'sy': 'http://purl.org/rss/1.0/modules/syndication/',
-              'slash': 'http://purl.org/rss/1.0/modules/slash/',
               'media': 'http://search.yahoo.com/mrss/',
               'snf': 'http://www.smartnews.be/snf'
           }
@@ -59,110 +53,76 @@ jobs:
           for prefix, uri in nsmap.items():
               etree.register_namespace(prefix, uri)
           
-          fallback_thumbnail = 'https://ctv-clearlink.github.io/RSS-Feed/CableTV.com%20RSS%20Logo%20Header.png'
+          fallback = 'https://ctv-clearlink.github.io/RSS-Feed/CableTV.com%20RSS%20Logo%20Header.png'
           
-          xml_parts = ['<?xml version="1.0" encoding="UTF-8"?>']
-          xml_parts.append('<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:wfw="http://wellformedweb.org/CommentAPI/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:sy="http://purl.org/rss/1.0/modules/syndication/" xmlns:slash="http://purl.org/rss/1.0/modules/slash/" xmlns:media="http://search.yahoo.com/mrss/" xmlns:snf="http://www.smartnews.be/snf">')
-          xml_parts.append('<channel>')
-          xml_parts.append(f'<snf:logo><url>{fallback_thumbnail}</url></snf:logo>')
+          xml = ['<?xml version="1.0" encoding="UTF-8"?><rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:media="http://search.yahoo.com/mrss/" xmlns:snf="http://www.smartnews.be/snf"><channel>']
+          xml.append(f'<snf:logo><url>{fallback}</url></snf:logo>')
           
           for elem in channel:
               if elem.tag == 'item':
                   break
               if 'logo' not in elem.tag.lower():
-                  xml_parts.append(etree.tostring(elem, encoding='unicode', method='xml'))
+                  xml.append(etree.tostring(elem, encoding='unicode'))
           
-          def scrape_page(url):
+          for item in items:
+              link = item.find('link').text.split('?')[0]
+              
+              # FETCH PAGE FOR FULL TITLE AND IMAGE
               try:
-                  r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+                  r = requests.get(link, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
                   soup = BeautifulSoup(r.text, 'html.parser')
                   
-                  # Get title
-                  title_tag = soup.find('meta', property='og:title')
-                  title = html_lib.unescape(title_tag['content']) if title_tag and title_tag.get('content') else None
+                  og_title = soup.find('meta', property='og:title')
+                  title = og_title['content'] if og_title else item.find('title').text
                   
-                  # Get image
-                  img_tag = soup.find('meta', property='og:image')
-                  image = img_tag['content'] if img_tag and img_tag.get('content') else None
-                  if image and ('logo' in image.lower() or 'icon' in image.lower()):
-                      image = None
+                  og_image = soup.find('meta', property='og:image')
+                  image = og_image['content'] if og_image else fallback
+                  if 'logo' in image.lower():
+                      image = fallback
                   
-                  # Get content
                   article = soup.find('article')
                   if article:
-                      # Remove junk
-                      for tag in article.find_all(['script', 'style', 'nav', 'footer', 'header']):
+                      for tag in article.find_all(['script', 'style', 'nav', 'footer']):
                           tag.decompose()
-                      # Remove forms and buttons with affiliate links
                       for form in article.find_all('form'):
                           form.decompose()
-                      for a in article.find_all('a', href=re.compile(r'aff_c|go\.cabletv', re.I)):
-                          parent = a.parent
-                          while parent and parent.name in ['div', 'button']:
-                              parent.decompose()
-                              break
-                      # Limit links
-                      for link in article.find_all('a')[3:]:
-                          link.unwrap()
                       content = str(article)
-                      return title, image, content
-                  return title, image, None
+                  else:
+                      # Fallback to RSS content
+                      content_elem = item.find('content:encoded', nsmap)
+                      content = content_elem.text if content_elem is not None else ''
               except:
-                  return None, None, None
-          
-          for idx, item in enumerate(items):
-              link_elem = item.find('link')
-              link = link_elem.text.split('?')[0] if link_elem is not None and link_elem.text else None
+                  title = item.find('title').text
+                  image = fallback
+                  content_elem = item.find('content:encoded', nsmap)
+                  content = content_elem.text if content_elem is not None else ''
               
-              title, image, content = scrape_page(link) if link else (None, None, None)
-              time.sleep(0.5)
-              
-              if not title:
-                  t = item.find('title')
-                  title = t.text if t is not None else 'Unknown'
-                  title = re.sub(r'\[current_date[^\]]*\]', str(datetime.now().year), title)
-              
-              if not content:
-                  for elem in item:
-                      tag = etree.QName(elem.tag).localname if '}' in elem.tag else elem.tag
-                      ns = etree.QName(elem.tag).namespace if '}' in elem.tag else None
-                      if ns == 'http://purl.org/rss/1.0/modules/content/' and tag == 'encoded':
-                          content = elem.text or ''
-                          break
-              
-              if not image:
-                  image = fallback_thumbnail
-              if not image.startswith('http'):
-                  image = 'https://www.cabletv.com' + image if image.startswith('/') else 'https:' + image
-              image = image.replace('&', '&amp;')
-              
-              xml_parts.append('<item>')
-              xml_parts.append(f'<title><![CDATA[{title}]]></title>')
+              # Build item
+              xml.append('<item>')
+              xml.append(f'<title><![CDATA[{title}]]></title>')
               
               for elem in item:
-                  tag = etree.QName(elem.tag).localname if '}' in elem.tag else elem.tag
-                  ns = etree.QName(elem.tag).namespace if '}' in elem.tag else None
-                  if elem.tag == 'title' or (ns == 'http://purl.org/rss/1.0/modules/content/' and tag == 'encoded') or ns == 'http://search.yahoo.com/mrss/':
+                  if elem.tag in ['title'] or '}' in elem.tag and 'encoded' in elem.tag or '}' in elem.tag and 'thumbnail' in elem.tag:
                       continue
-                  xml_parts.append(etree.tostring(elem, encoding='unicode', method='xml'))
+                  xml.append(etree.tostring(elem, encoding='unicode'))
               
-              xml_parts.append(f'<content:encoded><![CDATA[{content}]]></content:encoded>')
+              xml.append(f'<content:encoded><![CDATA[{content}]]></content:encoded>')
               
-              if item.find('dc:creator', nsmap) is None:
-                  xml_parts.append('<dc:creator>CableTV.com</dc:creator>')
-              if item.find('pubDate') is None:
-                  xml_parts.append(f'<pubDate>{datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")}</pubDate>')
+              if not item.find('dc:creator', nsmap):
+                  xml.append('<dc:creator>CableTV.com</dc:creator>')
+              if not item.find('pubDate'):
+                  xml.append(f'<pubDate>{datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")}</pubDate>')
               
-              xml_parts.append(f'<media:thumbnail url="{image}"/>')
-              xml_parts.append('</item>')
+              xml.append(f'<media:thumbnail url="{image.replace("&", "&amp;")}"/>')
+              xml.append('</item>')
           
-          xml_parts.append('</channel></rss>')
-          xml_string = ''.join(xml_parts).replace('https://www.cabletv.com/feed', 'https://ctv-clearlink.github.io/RSS-Feed/feed.xml')
+          xml.append('</channel></rss>')
+          final = ''.join(xml).replace('https://www.cabletv.com/feed', 'https://ctv-clearlink.github.io/RSS-Feed/feed.xml')
           
-          with open('feed.xml', 'w', encoding='utf-8') as f:
-              f.write(xml_string)
+          with open('feed.xml', 'w') as f:
+              f.write(final)
           
-          print(f"✓ Done: {len(xml_string):,} bytes")
+          print(f"Done: {len(final)} bytes")
           EOF
       
       - name: Check for changes
@@ -173,9 +133,9 @@ jobs:
       - name: Commit and push feed
         if: steps.changes.outputs.changed == 'true'
         run: |
-          git config --local user.email="github-actions[bot]@users.noreply.github.com"
-          git config --local user.name="github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
           git add feed.xml
-          git commit -m "Update RSS feed"
+          git commit -m "Update feed"
           git pull --rebase origin main
           git push origin main
